@@ -26,6 +26,6 @@ Also bear in mind the following:
 
 The following libraries are used by Kinetic2MQTT.  They should be installed in your Arduino development environment prior to building:
 * IotWebConf version 3.2.1: https://github.com/prampec/IotWebConf
-* PubSubClient version 2.8.0: https://github.com/knolleary/pubsubclient/
-* RadioLib version 5.3.0: https://github.com/jgromes/RadioLib
-* AceCRC version 1.0.1: https://github.com/bxparks/AceCRC
+* PubSubClient version 2.8: https://github.com/knolleary/pubsubclient/
+* RadioLib version 7.4.0: https://github.com/jgromes/RadioLib
+* AceCRC version 1.1.1: https://github.com/bxparks/AceCRC

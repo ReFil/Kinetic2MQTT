@@ -77,10 +77,20 @@ void setup() {
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(PACKET_LENGTH);
 
+  //
+  // Because the sync word we're using is just before
+  // the payload and does not immediately follow the
+  // preamble as normal, we need to disable the preamble
+  // quality threshold (PQT) which would otherwise
+  // prevent the sync word from being recognised
+  // in RadioLib >= 6.0.0.
+  //
+  radio.setPreambleLength(PREAMBLE_LENGTH, 0);
+
   uint8_t syncWord[] = {0xA4, 0x23};
   radio.setSyncWord(syncWord, 2);
 
-  radio.setGdo0Action(setFlag);
+  radio.setGdo0Action(setFlag, RISING);
 
   state = radio.startReceive();
   if (state == RADIOLIB_ERR_NONE) {
