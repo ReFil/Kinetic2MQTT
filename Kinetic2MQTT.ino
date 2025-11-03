@@ -9,7 +9,7 @@
 using namespace ace_crc::crc16ccitt_byte;
 
 // Radio Config
-#define PACKET_LENGTH 5 // bytes
+#define PACKET_LENGTH 10 // bytes
 #define MIN_RSSI -100 // dBm
 #define CARRIER_FREQUENCY 433.3 // MHz
 #define BIT_RATE 100.0 // kbps
@@ -145,7 +145,7 @@ void setFlag(void) {
 }
 
 void loop() {
-  iotWebConf.doLoop();
+ // iotWebConf.doLoop();
 
   if (needReset) {
     Serial.println("Rebooting after 1 second.");
@@ -154,10 +154,10 @@ void loop() {
   }
 
   // If WiFi is connected but MQTT is not, establish MQTT connection
-  if ((iotWebConf.getState() == iotwebconf::OnLine) && !mqttClient.connected()) {
-    connectMqtt();
-  }
-  mqttClient.loop();
+ // if ((iotWebConf.getState() == iotwebconf::OnLine) && !mqttClient.connected()) {
+ //   connectMqtt();
+ // }
+ // mqttClient.loop();
 
   // If a message has been received and flag has been set by interrupt, process the message
   if(receivedFlag) {
@@ -169,6 +169,8 @@ void loop() {
       if (radio.getRSSI() > MIN_RSSI) {
         // Last 2 bytes are the CRC-16/AUG-CCITT of the first 3 bytes
         // Verify CRC and only continue if valid
+        Serial.print(radio.getRSSI());
+        Serial.print(",");
         byte messageArr[] = {byteArr[0], byteArr[1], byteArr[2]};
         unsigned long messageCRC = (byteArr[3] << 8) | byteArr[4];
         crc_t crc = crc_init();
@@ -176,9 +178,10 @@ void loop() {
         crc = crc_finalize(crc);
 
         // Does calculted CRC match the CRC in the message?
-        if (((unsigned long) crc) == messageCRC) {
+        if (true) {
           // First two bytes correspond to the switch ID
           // Convert to hex string
+          /*
           char switchID[5] = "";
           bytesToHexString(byteArr, 2, switchID);
 
@@ -205,12 +208,16 @@ void loop() {
             Serial.print(", value: ");
             Serial.println(buttonState);
 
-            publishFullMessage(switchID, buttonState, rssiString);  // usertopic/switchid/state 
+            //publishFullMessage(switchID, buttonState, rssiString);  // usertopic/switchid/state 
             
             strcpy(lastSentButtonAction, buttonAction);
             strcpy(lastSentSwitchID, switchID);
             lastSentMillis = millis();
-          }
+          }*/
+
+          char data[41] = "";
+          bytesToHexString(byteArr, 10, data);
+          Serial.println(data);
         } else {
           // Message CRC was invalid
           Serial.println("Error: CRC Mismatch!");
