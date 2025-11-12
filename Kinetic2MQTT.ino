@@ -9,8 +9,8 @@
 using namespace ace_crc::crc16ccitt_byte;
 
 // Radio Config
-#define PACKET_LENGTH 10 // bytes
-#define MIN_RSSI -100 // dBm
+#define PACKET_LENGTH 12 // bytes
+#define MIN_RSSI -85 // dBm
 #define CARRIER_FREQUENCY 433.3 // MHz
 #define BIT_RATE 100.0 // kbps
 #define FREQUENCY_DEVIATION 50.0 // kHz
@@ -86,7 +86,7 @@ void setup() {
   //
   radio.setPreambleLength(PREAMBLE_LENGTH, 0);
 
-  uint8_t syncWord[] = {0xA4, 0x23};
+  uint8_t syncWord[] = {0x10, 0xd2};
   radio.setSyncWord(syncWord, 2);
 
   radio.setGdo0Action(setFlag, RISING);
@@ -215,8 +215,8 @@ void loop() {
             lastSentMillis = millis();
           }*/
 
-          char data[41] = "";
-          bytesToHexString(byteArr, 10, data);
+          char data[49] = "";
+          bytesToHexString(byteArr, 11, data);
           Serial.println(data);
         } else {
           // Message CRC was invalid
