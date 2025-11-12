@@ -1,5 +1,9 @@
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <AceCRC.h>
+
+// Select the type of CRC algorithm we'll be using
+using namespace ace_crc::crc16ccitt_byte;
 
 // CC1101 pins (adjust as needed)
 #define CS_PIN 15
@@ -25,9 +29,42 @@ CC1101 radio = new Module(CS_PIN, GDO0_PIN, RADIOLIB_NC, GDO2_PIN);
 // Sync word: only 2 bytes supported, bitshift 0x21a4 to the right so we can add the extra 0 in
 const uint8_t syncWord[2] = {0x10, 0xd2};
 
-void encodeForTransmission(uint8_t *outBuf, uint8_t *inBuf){
-  uint8_t remainder;
+enum messageType {
+  POLL,
+  STATE,
+  SET,
+};
+
+
+void encodeForTransmission(uint8_t *outBuf, uint32_t deviceID, messageType msgType, bool state){
+  // First 4 bytes are device ID
+  // 5th Byte is 0x0D if polling, 0x0B if setting
+  // 6th Byte is 0x00 if polling, 0x01 if setting
+  // 7th Byte is 0x55 if polling, 0x07 if setting a receiver switch, 0x02 if setting a relay (IDK why) 
+  // (Relay device IDs seem to start with 0x00 based on a sample size of 4 ^w^)
+  // 8th byte is 0xAA for polling, 0x00 to set off, 0x01 to set on
+  // Final two bytes are CRC16/AUG-CCITT of first 8 bytes
+  uint8_t txBuf[10] = {(deviceID >> 24) & 0xFF,
+                      (deviceID >> 16) & 0xFF,
+                      (deviceID >> 8) & 0xFF,
+                      (deviceID >> 0) & 0xFF,
+                      (msgType == POLL) ? 0x0D : 0x0B,
+                      (msgType == POLL) ? 0x00 : 0x01,
+                      (msgType == POLL) ? 0x55 : ((deviceID >> 24) & 0xFF) ? 0x07 : 0x02,
+                      (msgType == POLL) ? 0xAA : (state ? 0x01 : 0x00),
+                      0x00,
+                      0x00};
+
+  // Calculate CRC and populate final bytes
+  crc_t crc = crc_init();
+  crc = crc_update(crc, txBuf, 8);
+  crc = crc_finalize(crc);
+
+  txBuf[8] = (crc >> 8) & 0xFF;
+  txBuf[9] = crc & 0xFF;
+
   // Takes the 10 byte data packet and returns a 12 byte data packet with the bytes shifted 9 bits along and 0b000100011 inserted at the beginning
+  // This accounts for the extra 0 bit in between preamble and actual sync word, and the third byte of the sync word, unsupported by cc1101
   for(int i=0; i<10; i++){
     outBuf[i+1] = (inBuf[i] >> 1) | (i==0 ? 0b10000000 : ((inBuf[i-1] & 0b00000001) << 7));
   }
@@ -105,18 +142,16 @@ void loop() {
 
   if(Serial.available()) {
     String input = Serial.readString();
-    if(input == "0\n") {
-      payload[7] = 0x00;
-      payload[8] = 0x74;
-      payload[9] = 0xb3;
-    }
-    else {
-      payload[7] = 0x01;
-      payload[8] = 0x64;
-      payload[9] = 0x92;
-    }
-    uint8_t outdata[13] = {0x00};
-    encodeForTransmission(outdata, payload);
+    // Parse string for device ID and chosen state
+    String deviceIDStr = input.substring(0, 8);
+    uint32_t deviceID = (uint32_t) strtoul(deviceIDStr.c_str(), NULL, 16);
+
+    bool state = input.substring(9,10) == "1" ? true : false;
+
+    uint8_t outdata[12];
+
+    encodeForTransmission(outdata, deviceID, SET, state);
+
     Serial.print("Transmitting packet: ");
     for(int i=0; i<12; i++) {
       Serial.print(outdata[i], HEX);
