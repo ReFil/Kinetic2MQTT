@@ -8,7 +8,7 @@ using namespace ace_crc::crc16ccitt_byte;
 // CC1101 pins (adjust as needed)
 #define CS_PIN 15
 #define GDO0_PIN 5
-#define GDO2_PIN 16
+#define GDO2_PIN 4
 
 // Radio settings
 #define FREQUENCY 433.3
@@ -17,6 +17,7 @@ using namespace ace_crc::crc16ccitt_byte;
 #define RXBW 135.0
 #define OUTPUT_POWER 10
 #define PREAMBLE_LENGTH 32
+
 
 // 10 data bytes, with 0b1 0x23 bitshifted in from the left to account for third sync word byte 
 // Actual data packet is B115EDDF0B0107016492
@@ -66,22 +67,10 @@ void encodeForTransmission(uint8_t *outBuf, uint32_t deviceID, messageType msgTy
   // Takes the 10 byte data packet and returns a 12 byte data packet with the bytes shifted 9 bits along and 0b000100011 inserted at the beginning
   // This accounts for the extra 0 bit in between preamble and actual sync word, and the third byte of the sync word, unsupported by cc1101
   for(int i=0; i<10; i++){
-    outBuf[i+1] = (inBuf[i] >> 1) | (i==0 ? 0b10000000 : ((inBuf[i-1] & 0b00000001) << 7));
+    outBuf[i+1] = (txBuf[i] >> 1) | (i==0 ? 0b10000000 : ((txBuf[i-1] & 0b00000001) << 7));
   }
   outBuf[0] = 0x11;
-  outBuf[11] = (inBuf[9] << 7);
-}
-
-void cc1101_prepareNextTransmit() {
-  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-
-  digitalWrite(CS_PIN, LOW);
-  SPI.transfer(0x3B); // SFTX
-  digitalWrite(CS_PIN, HIGH);
-  delayMicroseconds(10);
-
-  radio.standby(); // ready for next TX
-  SPI.endTransaction();
+  outBuf[11] = (txBuf[9] << 7);
 }
 
 // save transmission state between loops
