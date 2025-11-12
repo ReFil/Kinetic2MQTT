@@ -47,6 +47,25 @@ void cc1101_prepareNextTransmit() {
   SPI.endTransaction();
 }
 
+// save transmission state between loops
+int transmissionState = RADIOLIB_ERR_NONE;
+
+// flag to indicate that a packet was sent
+volatile bool transmittedFlag = false;
+
+// this function is called when a complete packet
+// is transmitted by the module
+// IMPORTANT: this function MUST be 'void' type
+//            and MUST NOT have any arguments!
+#if defined(ESP8266) || defined(ESP32)
+  ICACHE_RAM_ATTR
+#endif
+void setTxFlag(void) {
+  // we sent a packet, set the flag
+  transmittedFlag = true;
+}
+
+
 void setup() {
   Serial.begin(115200);
   while(!Serial);
@@ -62,12 +81,28 @@ void setup() {
 
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(12);
+  radio.setPacketSentAction(setTxFlag);
   radio.setSyncWord(syncWord, 2);
 
   Serial.println("Ready to transmit!");
 }
 
+
+
 void loop() {
+  //If transmission finished report status and cleanup
+  if(transmittedFlag) {
+    transmittedFlag = false;
+    if(transmissionState == RADIOLIB_ERR_NONE) {
+      Serial.println("Transmit success!");
+    } else {
+      Serial.print("Transmit failed, code ");
+      Serial.println(transmissionState);
+    }
+    radio.finishTransmit();
+    delay(50); // wait before next send
+  }
+
   if(Serial.available()) {
     String input = Serial.readString();
     if(input == "0\n") {
@@ -89,22 +124,6 @@ void loop() {
     }
     Serial.println();
 
-    int16_t res = radio.startTransmit(outdata, 12);
-
-    if(res == RADIOLIB_ERR_NONE) {
-      Serial.println("Transmit success!");
-    } else {
-      Serial.print("Transmit failed, code ");
-      Serial.println(res);
-    }
-
-    res = radio.finishTransmit();
-    if(res == RADIOLIB_ERR_NONE) {
-      Serial.println("Transmit success!");
-    } else {
-      Serial.print("Transmit failed, code ");
-      Serial.println(res);
-    }
-    delay(50); // wait before next send
+    transmissionState = radio.startTransmit(outdata, 12);
   }
 }
