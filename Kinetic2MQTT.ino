@@ -20,9 +20,11 @@ using namespace ace_crc::crc16ccitt_byte;
 
 // IotWebConf Config
 #define CONFIG_PARAM_MAX_LEN 128
-#define CONFIG_VERSION "mqt3"
+#define CONFIG_VERSION "mqt4"
 #define CONFIG_PIN 4 // D2
 #define STATUS_PIN 16 // D0
+#define MAX_DEVICE_IDS 32
+#define DEVICE_ID_LENGTH 9  // 8 hex chars + null terminator
 
 // Kinetic2MQTT Config
 #define DEBOUNCE_MILLIS 15
@@ -41,6 +43,9 @@ const char apPassword[] = "EMWhP56Q"; // Default password for SSID and configura
 void configSaved();
 bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper);
 
+// Storage for device IDs
+char deviceIDValues[MAX_DEVICE_IDS][DEVICE_ID_LENGTH] = {0};
+
 DNSServer dnsServer;
 WebServer server(80);
 WiFiClient net;
@@ -53,6 +58,7 @@ char mqttTopicValue[CONFIG_PARAM_MAX_LEN];
 
 IotWebConf iotWebConf(deviceName, &dnsServer, &server, apPassword, CONFIG_VERSION);
 IotWebConfParameterGroup mqttGroup = IotWebConfParameterGroup("mqtt", "MQTT configuration");
+IotWebConfParameterGroup deviceIdGroup = IotWebConfParameterGroup("deviceids", "Receiver Device IDs");
 IotWebConfTextParameter mqttServerParam = IotWebConfTextParameter("MQTT server", "mqttServer", mqttServerValue, CONFIG_PARAM_MAX_LEN);
 IotWebConfTextParameter mqttUserNameParam = IotWebConfTextParameter("MQTT user", "mqttUser", mqttUserNameValue, CONFIG_PARAM_MAX_LEN);
 IotWebConfPasswordParameter mqttUserPasswordParam = IotWebConfPasswordParameter("MQTT password", "mqttPass", mqttUserPasswordValue, CONFIG_PARAM_MAX_LEN);
@@ -60,10 +66,33 @@ IotWebConfTextParameter mqttTopicParam = IotWebConfTextParameter("MQTT Topic", "
 
 bool needReset = false;
 
+// Create device ID parameters array
+IotWebConfTextParameter* deviceIDParams[MAX_DEVICE_IDS];
+
+// parametrically initialise device ID parameters
+void initializeDeviceIDParams() {
+  for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+    char* paramId = new char[16];
+    char* paramLabel = new char[32];
+    
+    sprintf(paramId, "devId%d", i);
+    sprintf(paramLabel, "Device ID %d", i + 1);
+    
+    deviceIDParams[i] = new IotWebConfTextParameter(
+      paramLabel,
+      paramId,
+      deviceIDValues[i],
+      DEVICE_ID_LENGTH
+    );
+  }
+}
+
 // Global State Variables
 char lastSentSwitchID[5] = "";
 char lastSentButtonAction[8] = "";
 unsigned long lastSentMillis = 0;
+int last_polled_index;
+
 
 void setup() {
   Serial.begin(115200);
@@ -76,20 +105,13 @@ void setup() {
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(PACKET_LENGTH);
 
-  //
-  // Because the sync word we're using is just before
-  // the payload and does not immediately follow the
-  // preamble as normal, we need to disable the preamble
-  // quality threshold (PQT) which would otherwise
-  // prevent the sync word from being recognised
-  // in RadioLib >= 6.0.0.
-  //
   radio.setPreambleLength(PREAMBLE_LENGTH, 0);
 
+
+  // Sync word: only 2 bytes supported, bitshift 0x21a4 to the right so we can add the extra 0 in
   uint8_t syncWord[] = {0x10, 0xd2};
   radio.setSyncWord(syncWord, 2);
-
-  radio.setGdo0Action(setFlag, RISING);
+  radio.setGdo0Action(setRxFlag, RISING);
 
   state = radio.startReceive();
   if (state == RADIOLIB_ERR_NONE) {
@@ -103,6 +125,15 @@ void setup() {
   // Initialise IOTWebConf
 
   Serial.println("Initialising IotWebConf... ");
+  
+  // Initialize device ID parameters
+  initializeDeviceIDParams();
+  
+  // Add all device ID parameters to the group
+  for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+    deviceIdGroup.addItem(deviceIDParams[i]);
+  }
+  
   mqttGroup.addItem(&mqttServerParam);
   mqttGroup.addItem(&mqttUserNameParam);
   mqttGroup.addItem(&mqttUserPasswordParam);
@@ -111,6 +142,7 @@ void setup() {
   iotWebConf.setStatusPin(STATUS_PIN);
   iotWebConf.setConfigPin(CONFIG_PIN);
   iotWebConf.addParameterGroup(&mqttGroup);
+  iotWebConf.addParameterGroup(&deviceIdGroup);
   iotWebConf.setConfigSavedCallback(&configSaved);
   iotWebConf.setFormValidator(&formValidator);
 
@@ -126,7 +158,15 @@ void setup() {
   // Not requred due to presence of reset button to manually enable AP mode
   iotWebConf.setApTimeoutMs(0);
 
-  server.on("/", []{ iotWebConf.handleConfig(); });
+  server.on("/", []{ 
+    // Build custom form with chained device ID inputs
+    String html = "";
+    html += iotWebConf.getThingName();
+    html += " - Configuration\n";
+    
+    // Let IotWebConf handle the base config
+    iotWebConf.handleConfig(); 
+  });
   server.onNotFound([](){ iotWebConf.handleNotFound(); });
 
   // Initialise MQTT
@@ -139,13 +179,13 @@ volatile bool receivedFlag = false;
 #if defined(ESP8266) || defined(ESP32)
   ICACHE_RAM_ATTR
 #endif
-void setFlag(void) {
+void setRxFlag(void) {
   // we got a packet, set the flag
   receivedFlag = true;
 }
 
 void loop() {
- // iotWebConf.doLoop();
+  iotWebConf.doLoop();
 
   if (needReset) {
     Serial.println("Rebooting after 1 second.");
@@ -159,6 +199,13 @@ void loop() {
  // }
  // mqttClient.loop();
 
+  // We want to poll every switch once per minute
+  // Run a transmit loop every 60/number of devices seconds and iterate through each device
+  // We collect device changed events anyway so this is arguably unnecessary
+  if(!millis()%60000){
+    // Poll all known kinetic switches
+  }
+
   // If a message has been received and flag has been set by interrupt, process the message
   if(receivedFlag) {
     byte byteArr[PACKET_LENGTH];
@@ -169,35 +216,10 @@ void loop() {
       if (radio.getRSSI() > MIN_RSSI) {
         // Last 2 bytes are the CRC-16/AUG-CCITT of the first 3 bytes
         // Verify CRC and only continue if valid
-        Serial.print(radio.getRSSI());
-        Serial.print(",");
-        byte messageArr[] = {byteArr[0], byteArr[1], byteArr[2]};
-        unsigned long messageCRC = (byteArr[3] << 8) | byteArr[4];
-        crc_t crc = crc_init();
-        crc = crc_update(crc, messageArr, 3);
-        crc = crc_finalize(crc);
 
         // Does calculted CRC match the CRC in the message?
         if (true) {
-          // First two bytes correspond to the switch ID
-          // Convert to hex string
-          /*
-          char switchID[5] = "";
-          bytesToHexString(byteArr, 2, switchID);
-
-          char buttonState[3] = "";
-          byteToHexString(byteArr[2],buttonState);
-
-          char rssiString[20] = "";
-          sprintf(rssiString, "%f dBm", radio.getRSSI());
-
-          // First bit of third byte indicates press/release
-          // Bit shift and compare the result
-          char buttonAction[] = "release";
-          if ((byteArr[2] >> 7) == 0) {
-            strcpy(buttonAction, "press");
-          }
-          
+        
           // Do not send a message if this received message is the same as the previous one and the previous one was sent less than DEBOUNCE_MILLIS miliseconds ago
           // This is because Kinetic switches continuously send messages every milisecond or so until the power runs out, this logic deduplicates these
           if (!((strcmp(switchID, lastSentSwitchID) == 0) && (strcmp(buttonAction, lastSentButtonAction) == 0) && ((millis() - lastSentMillis) < DEBOUNCE_MILLIS))) {
@@ -213,7 +235,7 @@ void loop() {
             strcpy(lastSentButtonAction, buttonAction);
             strcpy(lastSentSwitchID, switchID);
             lastSentMillis = millis();
-          }*/
+          }
 
           char data[49] = "";
           bytesToHexString(byteArr, 11, data);
@@ -350,5 +372,62 @@ bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper) {
     valid = false;
   }
 
+  // Validate Device IDs
+  // Check that IDs are in proper format (8 hex characters) and there are no empty IDs in between filled ones
+  int lastFilledIndex = -1;
+  for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+    String devIdStr = webRequestWrapper->arg(deviceIDParams[i]->getId());
+    
+    if (devIdStr.length() > 0) {
+      // ID is filled - validate format
+      if (devIdStr.length() != 8) {
+        deviceIDParams[i]->errorMessage = "Must be exactly 8 hex characters (32-bit)!";
+        valid = false;
+      } else {
+        // Check all characters are valid hex
+        bool isValidHex = true;
+        for (char c : devIdStr) {
+          if (!isxdigit(c)) {
+            isValidHex = false;
+            break;
+          }
+        }
+        if (!isValidHex) {
+          deviceIDParams[i]->errorMessage = "Must be valid hexadecimal (0-9, A-F)!";
+          valid = false;
+        }
+      }
+      
+      // Check chaining: previous ID must be filled if current ID is filled
+      if (i > 0 && lastFilledIndex != i - 1) {
+        deviceIDParams[i]->errorMessage = "Previous Device ID must be filled first!";
+        valid = false;
+      }
+      
+      lastFilledIndex = i;
+    }
+  }
+
   return valid;
+}
+
+// Get the number of filled device IDs (respects chaining)
+int getFilledDeviceIDCount() {
+  int count = 0;
+  for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+    if (strlen(deviceIDValues[i]) > 0) {
+      count++;
+    } else {
+      break;  // Chain breaks here
+    }
+  }
+  return count;
+}
+
+// Get device ID at index as a uint32_t, or 0 if index is out of range or ID is not filled in the web form
+const uint32_t getDeviceID(int index) {
+  if (index >= 0 && index < MAX_DEVICE_IDS && strlen(deviceIDValues[index]) > 0) {
+    return strtol(deviceIDValues[index], 0, 16);
+  }
+  return 0;
 }
