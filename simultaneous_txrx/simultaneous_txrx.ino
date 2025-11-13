@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <AceCRC.h>
+#include "kinetic_helpers.h"
 
 // Select the type of CRC algorithm we'll be using
 using namespace ace_crc::crc16ccitt_byte;
@@ -26,83 +27,43 @@ CC1101 radio = new Module(CS_PIN, GDO0_PIN, RADIOLIB_NC, GDO2_PIN);
 // Sync word: only 2 bytes supported, bitshift 0x21a4 to the right so we can add the extra 0 in
 const uint8_t syncWord[2] = {0x10, 0xd2};
 
-enum messageType {
-  POLL,
-  STATE,
-  SET,
-};
-
-
-void encodeForTransmission(uint8_t *outBuf, uint32_t deviceID, messageType msgType, bool state){
-  // First 4 bytes are device ID
-  // 5th Byte is 0x0D if polling, 0x0B if setting
-  // 6th Byte is 0x00 if polling, 0x01 if setting
-  // 7th Byte is 0x55 if polling, 0x07 if setting a receiver switch, 0x02 if setting a relay (IDK why) 
-  // (Relay device IDs seem to start with 0x00 based on a sample size of 4 ^w^)
-  // 8th byte is 0xAA for polling, 0x00 to set off, 0x01 to set on
-  // Final two bytes are CRC16/AUG-CCITT of first 8 bytes
-  uint8_t txBuf[10] = {(deviceID >> 24) & 0xFF,
-                      (deviceID >> 16) & 0xFF,
-                      (deviceID >> 8) & 0xFF,
-                      (deviceID >> 0) & 0xFF,
-                      (msgType == POLL) ? 0x0D : 0x0B,
-                      (msgType == POLL) ? 0x00 : 0x01,
-                      (msgType == POLL) ? 0x55 : ((deviceID >> 24) & 0xFF) ? 0x07 : 0x02,
-                      (msgType == POLL) ? 0xAA : (state ? 0x01 : 0x00),
-                      0x00,
-                      0x00};
-
-  // Calculate CRC and populate final bytes
-  crc_t crc = crc_init();
-  crc = crc_update(crc, txBuf, 8);
-  crc = crc_finalize(crc);
-
-  txBuf[8] = (crc >> 8) & 0xFF;
-  txBuf[9] = crc & 0xFF;
-
-  // Takes the 10 byte data packet and returns a 12 byte data packet with the bytes shifted 9 bits along and 0b000100011 inserted at the beginning
-  // This accounts for the extra 0 bit in between preamble and actual sync word, and the third byte of the sync word, unsupported by cc1101
-  for(int i=0; i<10; i++){
-    outBuf[i+1] = (txBuf[i] >> 1) | (i==0 ? 0b10000000 : ((txBuf[i-1] & 0b00000001) << 7));
-  }
-  outBuf[0] = 0x11;
-  outBuf[11] = (txBuf[9] << 7);
-}
-
-void decodeTransmission(uint8_t *outBuf, uint8_t *inBuf){
-  // Take the 12 byte input packet and deshift it, returning the original 10 byte packet
-  for(int i=0; i<10; i++)
-    outBuf[i] = (inBuf[i+1] << 1) | ((inBuf[i+2] >> 7) & 0b1);
-
-}
-
-
 // save transmission state between loops
 int transmissionState = RADIOLIB_ERR_NONE;
 
 // flag to indicate that a packet was sent
 volatile bool transmittedFlag = false;
+// flag to track whether we are actively transmitting
+volatile bool txInProgress = false;
 
-// this function is called when a complete packet
-// is transmitted by the module
-// IMPORTANT: this function MUST be 'void' type
-//            and MUST NOT have any arguments!
+// Falling edge interrupt signalling completion of packet transmission/reception
+// Used to signal end of transmission
+
 #if defined(ESP8266) || defined(ESP32)
   ICACHE_RAM_ATTR
 #endif
 void setTxFlag(void) {
-  // we sent a packet, set the flag
-  transmittedFlag = true;
+  // Both GDO0 and GDO2 signal the same events, only set the flag if we did actually transmit something
+  // This interrupt will fire often but there's not much we can do about that without lib changes
+  if(txInProgress)
+    transmittedFlag = true;
+  
 }
 
 volatile bool receivedFlag = false;
+
+volatile bool rxInProgress = false;
+
+// Rising edge interrupt signalling the sync word has been received
+// Used to signal the start of data we want to receive
 
 #if defined(ESP8266) || defined(ESP32)
   ICACHE_RAM_ATTR
 #endif
 void setRxFlag(void) {
-  // we got a packet, set the flag
-  receivedFlag = true;
+  // Both GDO0 and GDO2 signal the same events, only set the flag if we're actually receiving something
+  // This interrupt will fire often but there's not much we can do about that without lib changes
+  if(rxInProgress)
+    receivedFlag = true;
 }
 
 
@@ -151,6 +112,11 @@ void loop() {
 
     uint8_t outdata[12];
 
+    // Clear the transmitted flag before starting new transmission
+    transmittedFlag = false;
+    
+    // Stop receiving before transmitting
+    rxInProgress = false;
     radio.finishReceive();
     delay(50);
 
@@ -163,11 +129,23 @@ void loop() {
     }
     Serial.println();
 
+    // flag that we're attempting a transmit so the ISR knows to accept the
+    // GDO2 interrupt as a TX completion event
+    txInProgress = true;
     transmissionState = radio.startTransmit(outdata, 12);
+    if(transmissionState != RADIOLIB_ERR_NONE) {
+      // startTransmit failed; clear the transmit-in-progress flag so
+      // that stray GDO2 events aren't treated as successful transmits
+      txInProgress = false;
+      Serial.print("startTransmit failed, code ");
+      Serial.println(transmissionState);
+    }
   }
+  
   //If transmission finished report status and cleanup
   if(transmittedFlag) {
     transmittedFlag = false;
+
     if(transmissionState == RADIOLIB_ERR_NONE) {
       Serial.println("Transmit success!");
     } else {
@@ -181,11 +159,19 @@ void loop() {
       Serial.print("cleanup failed, code ");
       Serial.println(err);
     }
+    
+    // clear the transmit-in-progress flag now tx completed
+    txInProgress = false;
+
     delay(25);
+
+    // go back to receiving
+    rxInProgress = true;
     radio.startReceive();
   }
 
   if(receivedFlag) {
+    rxInProgress = false;
     byte byteArr[PACKET_LENGTH];
     int state = radio.readData(byteArr, PACKET_LENGTH);
     
@@ -197,7 +183,7 @@ void loop() {
         Serial.print(radio.getRSSI());
         Serial.print(",");
         uint8_t dataBuf[10];
-        decodeTransmission(dataBuf, byteArr);
+        unshiftTransmission(dataBuf, byteArr);
         char data[41] = "";
         bytesToHexString(dataBuf, 10, data);
         Serial.println(data);
@@ -212,6 +198,7 @@ void loop() {
     // Reset flag and put module back into listening mode
     // This should be the last thing in the loop
     receivedFlag = false;
+    rxInProgress = true;
     radio.startReceive();
   }
 }
