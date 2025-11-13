@@ -96,7 +96,7 @@ void setup() {
     while (true);
   }
 
-
+  rxInProgress = true;
   Serial.println("Ready to transmit!");
 }
 
@@ -118,7 +118,6 @@ void loop() {
     // Stop receiving before transmitting
     rxInProgress = false;
     radio.finishReceive();
-    delay(50);
 
     encodeForTransmission(outdata, deviceID, SET, state);
 
@@ -163,7 +162,6 @@ void loop() {
     // clear the transmit-in-progress flag now tx completed
     txInProgress = false;
 
-    delay(25);
 
     // go back to receiving
     rxInProgress = true;
