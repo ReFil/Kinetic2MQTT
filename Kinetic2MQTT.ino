@@ -3,10 +3,15 @@
 #include <IotWebConf.h>
 #include <IotWebConfUsing.h>
 #include <PubSubClient.h>
-#include <AceCRC.h>
+#include <ArduinoJson.h>
+#include "kinetic_helpers.h"
 
-// Select the type of CRC algorithm we'll be using
-using namespace ace_crc::crc16ccitt_byte;
+// Enable polling the devices
+#define ENABLE_POLLING
+// Polling interval in seconds (multiplied by number of devices for per-device poll interval)
+#define POLL_INTERVAL_S 60
+
+//#define DEBUG_SERIAL
 
 // Radio Config
 #define PACKET_LENGTH 12 // bytes
@@ -16,29 +21,29 @@ using namespace ace_crc::crc16ccitt_byte;
 #define FREQUENCY_DEVIATION 50.0 // kHz
 #define RX_BANDWIDTH 135.0 // kHz
 #define OUTPUT_POWER 10 // dBm
-#define PREAMBLE_LENGTH 16 // bits
+#define PREAMBLE_LENGTH 32 // bits 
 
 // IotWebConf Config
 #define CONFIG_PARAM_MAX_LEN 128
 #define CONFIG_VERSION "mqt4"
-#define CONFIG_PIN 4 // D2
+#define CONFIG_PIN 2 // D4
 #define STATUS_PIN 16 // D0
 #define MAX_DEVICE_IDS 32
 #define DEVICE_ID_LENGTH 9  // 8 hex chars + null terminator
 
-// Kinetic2MQTT Config
-#define DEBOUNCE_MILLIS 15
+#define DEBOUNCE_MILLIS 300
 
-// CC1101 has the following connections:
-// CS pin:    15
-// GDO0 pin:  5
-// RST pin:   unused
-// GDO2 pin:  unused (optional)
-CC1101 radio = new Module(15, 5, RADIOLIB_NC, RADIOLIB_NC);
+// CC1101 pins (adjust as needed)
+#define CS_PIN 15
+#define GDO0_PIN 5
+#define GDO2_PIN 4
+
+// CC1101 module
+CC1101 radio = new Module(CS_PIN, GDO0_PIN, RADIOLIB_NC, GDO2_PIN);
 
 // Set up IotWebConf
 const char deviceName[] = "kinetic2mqtt";
-const char apPassword[] = "EMWhP56Q"; // Default password for SSID and configuration page, can be changed after first boot
+const char apPassword[] = "EMWhP56Q"; // Default password for SSID and configuration page, must be changed after first boot
 
 void configSaved();
 bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper);
@@ -66,6 +71,13 @@ IotWebConfTextParameter mqttTopicParam = IotWebConfTextParameter("MQTT Topic", "
 
 bool needReset = false;
 
+// Radio TX/RX state management
+int transmissionState = RADIOLIB_ERR_NONE;
+volatile bool transmittedFlag = false;
+volatile bool txInProgress = false;
+volatile bool receivedFlag = false;
+volatile bool rxInProgress = false;
+
 // Create device ID parameters array
 IotWebConfTextParameter* deviceIDParams[MAX_DEVICE_IDS];
 
@@ -88,44 +100,123 @@ void initializeDeviceIDParams() {
 }
 
 // Global State Variables
-char lastSentSwitchID[5] = "";
-char lastSentButtonAction[8] = "";
-unsigned long lastSentMillis = 0;
-int last_polled_index;
+unsigned long lastPollTime = 0;
+uint8_t lastPolledIndex = 0;
+bool mqttJustConnected = false;
+
+// Device state tracking
+struct DeviceState {
+  uint32_t deviceID;
+  uint8_t state;
+  int rssi;
+  unsigned long lastUpdate;
+  unsigned long lastMessageTime;
+};
+
+DeviceState deviceStates[MAX_DEVICE_IDS];
+
+// MQTT Callback for handling incoming messages
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  #ifdef DEBUG_SERIAL
+  Serial.print("MQTT message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  #endif
+
+  // Extract device ID from topic (format: kinetic/set/DEVICEID)
+  String topicStr(topic);
+  int lastSlash = topicStr.lastIndexOf('/');
+  String deviceIDStr = topicStr.substring(lastSlash + 1);
+  
+  // Parse JSON payload
+  StaticJsonDocument<128> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    #ifdef DEBUG_SERIAL
+    Serial.println("JSON parse error");
+    #endif
+    return;
+  }
+  
+  if (!doc.containsKey("state")) {
+    #ifdef DEBUG_SERIAL
+    Serial.println("Missing 'state' field");
+    #endif
+    return;
+  }
+  
+  uint32_t deviceID = strtoul(deviceIDStr.c_str(), NULL, 16);
+  uint8_t newState = doc["state"];
+  bool desiredState = (newState == 1);
+  
+  #ifdef DEBUG_SERIAL
+  Serial.print("Setting device ");
+  Serial.print(deviceID, HEX);
+  Serial.print(" to state ");
+  Serial.println(desiredState);
+  #endif
+  
+  // Transmit command
+  rxInProgress = false;
+  radio.finishReceive();
+  
+  uint8_t txBuf[12];
+  encodeForTransmission(txBuf, deviceID, SET, desiredState);
+  
+  txInProgress = true;
+  transmissionState = radio.startTransmit(txBuf, PACKET_LENGTH);
+  if (transmissionState != RADIOLIB_ERR_NONE) {
+    txInProgress = false;
+    #ifdef DEBUG_SERIAL
+    Serial.print("TX failed, code ");
+    Serial.println(transmissionState);
+    #endif
+  }
+}
 
 
 void setup() {
+  #ifdef DEBUG_SERIAL
   Serial.begin(115200);
+  #endif
   pinMode(CONFIG_PIN, INPUT_PULLUP);
 
   // Initialise and configure CC1101
+  #ifdef DEBUG_SERIAL
   Serial.print("Initializing Radio... ");
+  #endif
 
   int state = radio.begin(CARRIER_FREQUENCY, BIT_RATE, FREQUENCY_DEVIATION, RX_BANDWIDTH, OUTPUT_POWER, PREAMBLE_LENGTH);
   radio.setCrcFiltering(false);
   radio.fixedPacketLengthMode(PACKET_LENGTH);
-
   radio.setPreambleLength(PREAMBLE_LENGTH, 0);
-
+  radio.setPacketSentAction(setTxFlag);
+  radio.setPacketReceivedAction(setRxFlag);
 
   // Sync word: only 2 bytes supported, bitshift 0x21a4 to the right so we can add the extra 0 in
   uint8_t syncWord[] = {0x10, 0xd2};
   radio.setSyncWord(syncWord, 2);
-  radio.setGdo0Action(setRxFlag, RISING);
 
   state = radio.startReceive();
   if (state == RADIOLIB_ERR_NONE) {
+    #ifdef DEBUG_SERIAL
     Serial.println("done!");
+    #endif
+    rxInProgress = true;
   } else {
+    #ifdef DEBUG_SERIAL
     Serial.print("failed, code ");
     Serial.println(state);
+    #endif
     while (true);
   }
 
   // Initialise IOTWebConf
-
+  #ifdef DEBUG_SERIAL
   Serial.println("Initialising IotWebConf... ");
-  
+  #endif
+
   // Initialize device ID parameters
   initializeDeviceIDParams();
   
@@ -155,159 +246,312 @@ void setup() {
   }
 
   // This will disable the device sitting in AP mode for 30s on startup
-  // Not requred due to presence of reset button to manually enable AP mode
-  iotWebConf.setApTimeoutMs(0);
+  // Not required due to presence of reset button to manually enable AP mode
+  //iotWebConf.setApTimeoutMs(0);
 
-  server.on("/", []{ 
-    // Build custom form with chained device ID inputs
-    String html = "";
-    html += iotWebConf.getThingName();
-    html += " - Configuration\n";
-    
-    // Let IotWebConf handle the base config
-    iotWebConf.handleConfig(); 
-  });
+  server.on("/", []{ iotWebConf.handleConfig(); });
   server.onNotFound([](){ iotWebConf.handleNotFound(); });
 
   // Initialise MQTT
+  mqttClient.setCallback(onMqttMessage);
   mqttClient.setServer(mqttServerValue, 1883);
+
+  lastPollTime = millis();
 }
 
-// flag to indicate that a packet was received
-volatile bool receivedFlag = false;
+// TX/RX interrupt handlers
+#if defined(ESP8266) || defined(ESP32)
+  ICACHE_RAM_ATTR
+#endif
+void setTxFlag(void) {
+  if(txInProgress)
+    transmittedFlag = true;
+}
 
 #if defined(ESP8266) || defined(ESP32)
   ICACHE_RAM_ATTR
 #endif
 void setRxFlag(void) {
-  // we got a packet, set the flag
-  receivedFlag = true;
+  if(rxInProgress)
+    receivedFlag = true;
 }
 
 void loop() {
   iotWebConf.doLoop();
 
   if (needReset) {
+    #ifdef DEBUG_SERIAL
     Serial.println("Rebooting after 1 second.");
+    #endif
     iotWebConf.delay(1000);
     ESP.restart();
   }
 
   // If WiFi is connected but MQTT is not, establish MQTT connection
- // if ((iotWebConf.getState() == iotwebconf::OnLine) && !mqttClient.connected()) {
- //   connectMqtt();
- // }
- // mqttClient.loop();
+  if ((iotWebConf.getState() == iotwebconf::OnLine) && !mqttClient.connected()) {
+    connectMqtt();
+  }
+  mqttClient.loop();
 
-  // We want to poll every switch once per minute
-  // Run a transmit loop every 60/number of devices seconds and iterate through each device
-  // We collect device changed events anyway so this is arguably unnecessary
-  if(!millis()%60000){
-    // Poll all known kinetic switches
+  // Poll all devices after we connect to mqtt
+  if (mqttJustConnected && rxInProgress) {
+    int deviceCount = getFilledDeviceIDCount();
+    if (millis()- lastPollTime > 250) {
+      // Put a short interval between the initial polls so the rest of the code can keep up, otherwise we only catch the final poll
+      if (deviceCount > 0 && lastPolledIndex < deviceCount) {
+        uint32_t deviceID = getDeviceID(lastPolledIndex);
+        if (deviceID != 0) {
+          pollDevice(deviceID);
+        }
+        lastPolledIndex++;
+        lastPollTime = millis();
+      } else {
+        // Finished polling all devices
+        mqttJustConnected = false;
+        lastPolledIndex = 0;
+      }
+    }
   }
 
-  // If a message has been received and flag has been set by interrupt, process the message
+  // Poll devices periodically (technically unnecessary as all devices send a message when switched, but some situations these messages can be missed)
+  #ifdef ENABLE_POLLING
+  if(millis() - lastPollTime >= (POLL_INTERVAL_S * 1000)) {
+    int deviceCount = getFilledDeviceIDCount();
+    if (deviceCount > 0) {
+      uint32_t deviceID = getDeviceID(lastPolledIndex);
+      if (deviceID != 0) {
+        pollDevice(deviceID);
+      }
+      lastPolledIndex = (lastPolledIndex + 1) % deviceCount;
+    }
+    lastPollTime = millis();
+  }
+  #endif
+
+  // Handle transmission completion
+  if(transmittedFlag) {
+    transmittedFlag = false;
+    
+    if(transmissionState == RADIOLIB_ERR_NONE) {
+      #ifdef DEBUG_SERIAL
+      Serial.println("TX success!");
+      #endif
+    } else {
+      #ifdef DEBUG_SERIAL
+      Serial.print("TX failed, code ");
+      Serial.println(transmissionState);
+      #endif
+    }
+    
+    int err = radio.finishTransmit();
+    if(err != RADIOLIB_ERR_NONE) {
+      #ifdef DEBUG_SERIAL
+      Serial.print("TX cleanup failed, code ");
+      Serial.println(err);
+      #endif
+    }
+    
+    txInProgress = false;
+    rxInProgress = true;
+    radio.startReceive();
+  }
+
+  // Handle received messages
   if(receivedFlag) {
+    receivedFlag = false;
+    rxInProgress = false;
+    
     byte byteArr[PACKET_LENGTH];
     int state = radio.readData(byteArr, PACKET_LENGTH);
     
     if (state == RADIOLIB_ERR_NONE) {
-      // Only process the message if RSSI is high enough, this prevents uncessary calculating CRC for noise
       if (radio.getRSSI() > MIN_RSSI) {
-        // Last 2 bytes are the CRC-16/AUG-CCITT of the first 3 bytes
-        // Verify CRC and only continue if valid
+        // Decode the transmission
+        uint8_t dataBuf[10];
+        unshiftTransmission(dataBuf, byteArr);
 
-        // Does calculted CRC match the CRC in the message?
-        if (true) {
+        #ifdef DEBUG_SERIAL
+        char data[41] = "";
+        bytesToHexString(dataBuf, 10, data);
+        Serial.println(data);
+        #endif
         
-          // Do not send a message if this received message is the same as the previous one and the previous one was sent less than DEBOUNCE_MILLIS miliseconds ago
-          // This is because Kinetic switches continuously send messages every milisecond or so until the power runs out, this logic deduplicates these
-          if (!((strcmp(switchID, lastSentSwitchID) == 0) && (strcmp(buttonAction, lastSentButtonAction) == 0) && ((millis() - lastSentMillis) < DEBOUNCE_MILLIS))) {
-            Serial.print("Button pressed: ");
-            Serial.print(switchID);
-            Serial.print(", action: ");
-            Serial.print(buttonAction);
-            Serial.print(", value: ");
-            Serial.println(buttonState);
-
-            //publishFullMessage(switchID, buttonState, rssiString);  // usertopic/switchid/state 
-            
-            strcpy(lastSentButtonAction, buttonAction);
-            strcpy(lastSentSwitchID, switchID);
-            lastSentMillis = millis();
-          }
-
-          char data[49] = "";
-          bytesToHexString(byteArr, 11, data);
-          Serial.println(data);
+        struct kineticMessage *msg;
+        msg = decodeTransmission(dataBuf);
+        
+        if (msg->devType != UNKNOWN && (msg->devType != POLL)) {
+          handleReceivedMessage(msg);
         } else {
-          // Message CRC was invalid
-          Serial.println("Error: CRC Mismatch!");
+          #ifdef DEBUG_SERIAL
+          Serial.println("Decoded message is invalid or unknown type");
+          #endif
         }
       }
     } else {
       // An error occurred receiving the message
+      #ifdef DEBUG_SERIAL
       Serial.print("RadioLib error: ");
       Serial.println(state);
+      #endif
     }
-
-    // Reset flag and put module back into listening mode
-    // This should be the last thing in the loop
-    receivedFlag = false;
+    
+    // Resume receiving
+    rxInProgress = true;
     radio.startReceive();
   }
 }
 
-// Publish [value] to MQTT at topic: [mqttTopicValue]/[topicLevel1]/[topicLevel2]
-void publishMqtt(char value[]) {
-  char compiledTopic[strlen(mqttTopicValue) + 7] = "";
-  strcat(compiledTopic, mqttTopicValue);
-  strcat(compiledTopic, "/system");
+// Handle received kinetic message and publish to MQTT
+void handleReceivedMessage(struct kineticMessage* msg) {
+  char deviceIDStr[9];
+  sprintf(deviceIDStr, "%08X", msg->deviceID);
   
-  mqttClient.publish(compiledTopic, value);
+  unsigned long currentTime = millis();
+  
+  // Debounce switch-only devices (they repeatedly transmit until they run out of energy)
+  if (msg->devType == SWITCH_ONLY) {
+    for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+      if (deviceStates[i].deviceID == msg->deviceID) {
+        // Skip if same message received within debounce window and state unchanged
+        if ((currentTime - deviceStates[i].lastMessageTime) < DEBOUNCE_MILLIS && deviceStates[i].state == msg->state) {
+          return;
+        }
+        break;
+      }
+    }
+  }
+  
+  // Update device state tracking
+  for (int i = 0; i < MAX_DEVICE_IDS; i++) {
+    if (deviceStates[i].deviceID == msg->deviceID) {
+      deviceStates[i].state = msg->state;
+      deviceStates[i].rssi = (int)radio.getRSSI();
+      deviceStates[i].lastUpdate = currentTime;
+      deviceStates[i].lastMessageTime = currentTime;
+      break;
+    }
+  }
+  
+  if (mqttClient.connected()) {
+    // Build topic: mqttTopicValue/state/DEVICEID
+    char topic[strlen(mqttTopicValue) + 18] = "";
+    strcat(topic, mqttTopicValue);
+    strcat(topic, "/state/");
+    strcat(topic, deviceIDStr);
+    
+    // Build JSON payload
+    StaticJsonDocument<256> doc;
+    doc["state"] = msg->state;
+    doc["type"] = msg->msgType;
+    doc["rssi"] = radio.getRSSI();
+    doc["device_type"] = msg->devType;
+    
+    char payload[256];
+    serializeJson(doc, payload, sizeof(payload));
+    
+    mqttClient.publish(topic, payload);
+    #ifdef DEBUG_SERIAL
+    Serial.print("Published state for device ");
+    Serial.print(deviceIDStr);
+    Serial.print(" to ");
+    Serial.println(topic);
+    #endif
+  }
 }
 
-void publishFullMessage(char switchIdent[], char value[], char rssi[]) {
-  char compiledTopic[strlen(mqttTopicValue) + strlen(switchIdent) + 9] = "";
-  strcat(compiledTopic, mqttTopicValue);
-  strcat(compiledTopic, "/state/");
-  strcat(compiledTopic, switchIdent);
-
-  char compiledValue[28 + strlen(value) + strlen(rssi)] = "";
-  strcat(compiledValue,"{\"rssi\":\"");
-  strcat(compiledValue, rssi);
-  strcat(compiledValue,"\",\"buttonstate\":\"");
-  strcat(compiledValue, value);
-  strcat(compiledValue,"\"}");
-
-  mqttClient.publish(compiledTopic, compiledValue);
+// Poll a specific device for its current state
+void pollDevice(uint32_t deviceID) {
+  #ifdef DEBUG_SERIAL
+  Serial.print("Polling device ");
+  Serial.println(deviceID, HEX);
+  #endif
+  
+  if (!rxInProgress) {
+    #ifdef DEBUG_SERIAL
+    Serial.println("WARNING: RX not in progress, cannot poll");
+    #endif
+    return;
+  }
+  
+  rxInProgress = false;
+  radio.finishReceive();
+  
+  uint8_t txBuf[12];
+  encodeForTransmission(txBuf, deviceID, POLL, false);
+  
+  txInProgress = true;
+  transmissionState = radio.startTransmit(txBuf, PACKET_LENGTH);
+  if (transmissionState != RADIOLIB_ERR_NONE) {
+    txInProgress = false;
+    #ifdef DEBUG_SERIAL
+    Serial.print("Poll TX failed, code ");
+    Serial.println(transmissionState);
+    #endif
+  }
 }
 
-// Establish an MQTT connection, if connection fails this function will delay for 5 seconds and then return
-// Connection will be re-attempted at next execution of loop()
+// Publish system status to MQTT
+void publishSystemStatus(const char* status) {
+  if (mqttClient.connected()) {
+    char topic[strlen(mqttTopicValue) + 8] = "";
+    strcat(topic, mqttTopicValue);
+    strcat(topic, "/system");
+    
+    StaticJsonDocument<128> doc;
+    doc["status"] = status;
+    
+    char payload[256];
+    serializeJson(doc, payload, sizeof(payload));
+    
+    mqttClient.publish(topic, payload);
+  }
+}
+
+// Establish an MQTT connection and subscribe to control topics
 void connectMqtt() {
   // Loop until we're reconnected
+  #ifdef DEBUG_SERIAL
   Serial.println("Attempting MQTT connection...");
+  #endif
 
   // Create a random client ID
   String clientId = iotWebConf.getThingName();
   clientId += "-";
   clientId += String(random(0xffff), HEX);
 
+  #ifdef DEBUG_SERIAL
   Serial.println(clientId);
+  #endif
 
   // Attempt to connect
   if (connectMqttOptions()) {
-    Serial.println("connected");
-    // Once connected, publish an announcement...
-    char topicLevel1[] = "status";
-    char topicLevel2[] = "connection";
-    char messageValue[] = "connected";
-    publishMqtt(messageValue);
+    #ifdef DEBUG_SERIAL
+    Serial.println("MQTT connected");
+    #endif
+    
+    // Publish online status
+    publishSystemStatus("online");
+    
+    // Subscribe to set commands for all devices: kinetic/set/+
+    char setTopic[strlen(mqttTopicValue) + 6] = "";
+    strcat(setTopic, mqttTopicValue);
+    strcat(setTopic, "/set/+");
+    
+    #ifdef DEBUG_SERIAL
+    Serial.print("Subscribing to: ");
+    Serial.println(setTopic);
+    #endif
+    mqttClient.subscribe(setTopic);
+    
+    // Set flag to poll devices in main loop (non-blocking)
+    mqttJustConnected = true;
+    lastPollTime = 0; // Force immediate polling
   } else {
-    Serial.print("MQTT Connection Failed:");
-    Serial.print(mqttClient.state());
-    Serial.println(".  Trying again in 5 seconds");
+    #ifdef DEBUG_SERIAL
+    Serial.print("MQTT Connection Failed, state: ");
+    Serial.println(mqttClient.state());
+    Serial.println("Retrying in 5 seconds");
+    #endif
     // Wait 5 seconds before retrying
     iotWebConf.delay(5000);
   }
@@ -340,7 +584,7 @@ void bytesToHexString(byte array[], unsigned int len, char buffer[]) {
     buffer[len*2] = '\0';
 }
 
-// Convert array of bytes into a string containing the HEX representation of the array
+// Convert a single byte into a string containing the HEX representation
 void byteToHexString(byte mybyte, char buffer[]) {
     byte nib1 = (mybyte >> 4) & 0x0F;
     byte nib2 = (mybyte >> 0) & 0x0F;
@@ -351,13 +595,17 @@ void byteToHexString(byte mybyte, char buffer[]) {
 
 // If configuration is saved in IOTWebConf, reboot the device
 void configSaved() {
+  #ifdef DEBUG_SERIAL
   Serial.println("Configuration was updated.");
+  #endif
   needReset = true;
 }
 
 // Validate the data entered into the IOTWebConf configuration page
 bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper) {
+  #ifdef DEBUG_SERIAL
   Serial.println("Validating form.");
+  #endif
   bool valid = true;
 
   int l = webRequestWrapper->arg(mqttServerParam.getId()).length();
@@ -411,7 +659,7 @@ bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper) {
   return valid;
 }
 
-// Get the number of filled device IDs (respects chaining)
+// Get the number of filled device IDs
 int getFilledDeviceIDCount() {
   int count = 0;
   for (int i = 0; i < MAX_DEVICE_IDS; i++) {
@@ -427,7 +675,7 @@ int getFilledDeviceIDCount() {
 // Get device ID at index as a uint32_t, or 0 if index is out of range or ID is not filled in the web form
 const uint32_t getDeviceID(int index) {
   if (index >= 0 && index < MAX_DEVICE_IDS && strlen(deviceIDValues[index]) > 0) {
-    return strtol(deviceIDValues[index], 0, 16);
+    return strtoul(deviceIDValues[index], 0, 16);
   }
   return 0;
 }
