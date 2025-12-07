@@ -88,7 +88,7 @@ void unshiftTransmission(uint8_t *outBuf, uint8_t *inBuf){
 
 }
 
-struct kineticMessage* decodeTransmission(uint8_t *inBuf){
+struct kineticMessage decodeTransmission(uint8_t *inBuf){
   kineticMessage msg;
 
   // Check if message is a short 5 byte switch message
@@ -103,7 +103,7 @@ struct kineticMessage* decodeTransmission(uint8_t *inBuf){
     msg.devType = SWITCH_ONLY;
     msg.msgType = STATE; // Switch only devices only send state
     msg.state = inBuf[2];
-    return &msg;
+    return msg;
   }
   else {
     uint32_t messageCRC = (inBuf[8] << 8) | inBuf[9];
@@ -116,7 +116,7 @@ struct kineticMessage* decodeTransmission(uint8_t *inBuf){
       msg.deviceID = 0;
       msg.devType = UNKNOWN;
       msg.msgType = MSG_UNKNOWN;
-      return &msg;
+      return msg;
     } else {
       // Valid 10 byte message
         // First 4 bytes are device ID
@@ -144,11 +144,14 @@ struct kineticMessage* decodeTransmission(uint8_t *inBuf){
 
       // State is in byte 7
       msg.state = inBuf[7];
-      return &msg;
+      return msg;
     }
   }
 
 
 // Something has gone horribly wrong
-  return nullptr;
+  msg.deviceID = 0;
+      msg.devType = UNKNOWN;
+      msg.msgType = MSG_UNKNOWN;
+      return msg;
 }

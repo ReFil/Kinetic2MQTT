@@ -9,10 +9,10 @@ using namespace ace_crc::crc16ccitt_byte;
  #define STATS_PRINT
 
 // Print the decoded message to the serial terminal
-// #define DECODED_DEBUG
+#define DECODED_DEBUG
 
 // Print the raw hex message to the terminal
-// #define RAW_DEBUG
+#define RAW_DEBUG
 
 // Disable filtering decoded message for known device types
 #define ALLOW_UNKNOWN_DEV
